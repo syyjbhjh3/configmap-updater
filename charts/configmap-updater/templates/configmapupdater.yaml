@@ -1,0 +1,31 @@
+{{- range .Values.configMapUpdaters }}
+apiVersion: ops.ops.example.io/v1alpha1
+kind: ConfigMapUpdater
+metadata:
+  name: {{ .name }}
+  namespace: {{ .namespace | default (include "configmap-updater.namespace" $) }}
+  labels:
+    app.kubernetes.io/name: {{ include "configmap-updater.fullname" $ }}
+    app.kubernetes.io/part-of: configmap-updater
+spec:
+  destinationClusterRef:
+    name: {{ .destinationClusterRef | default $.Values.destinationCluster.name }}
+  source:
+    namespace: {{ .source.namespace }}
+    name: {{ .source.name }}
+  target:
+    namespace: {{ .target.namespace }}
+    name: {{ .target.name }}
+  interval: {{ .interval }}
+  restartOnChange: {{ .restartOnChange }}
+  restartTargets:
+{{- if .restartTargets }}
+{{- range .restartTargets }}
+    - namespace: {{ .namespace }}
+      name: {{ .name }}
+{{- end }}
+{{- else }}
+    []
+{{- end }}
+---
+{{- end }}

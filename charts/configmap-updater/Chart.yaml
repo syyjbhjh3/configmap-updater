@@ -1,0 +1,6 @@
+apiVersion: v2
+name: configmap-updater
+description: Deploy configmap-updater custom resources in applications
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
