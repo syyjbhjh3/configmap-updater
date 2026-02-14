@@ -137,7 +137,10 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	dest.Status.LastValidatedTime = &nowValidated
 	_ = r.Status().Update(ctx, &dest)
 
-	sourceHash, err := hashConfigMap(sourceCM.Data, sourceCM.BinaryData)
+
+	ignoreKeys := toIgnoreKeySet(updater.Spec.IgnoreKeys)
+	sourceDataForCompare, sourceBinaryForCompare := filteredConfigMap(sourceCM.Data, sourceCM.BinaryData, ignoreKeys)
+	sourceHash, err := hashConfigMap(sourceDataForCompare, sourceBinaryForCompare)
 	if err != nil {
 		return r.failStatus(ctx, &updater, "SourceHashError", err.Error(), interval)
 	}
@@ -155,7 +158,8 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	changed := true
 	action := "noop"
 	if targetExists {
-		targetHash, hashErr := hashConfigMap(targetCM.Data, targetCM.BinaryData)
+		targetDataForCompare, targetBinaryForCompare := filteredConfigMap(targetCM.Data, targetCM.BinaryData, ignoreKeys)
+		targetHash, hashErr := hashConfigMap(targetDataForCompare, targetBinaryForCompare)
 		if hashErr != nil {
 			return r.failStatus(ctx, &updater, "TargetHashError", hashErr.Error(), interval)
 		}
@@ -180,8 +184,24 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 		targetCM.Labels["app.kubernetes.io/managed-by"] = "configmap-updater"
 		targetCM.Labels["configmap-updater.ops.example.io/policy"] = updater.Name
-		targetCM.Data = copyStringMap(sourceCM.Data)
-		targetCM.BinaryData = copyByteMap(sourceCM.BinaryData)
+		targetDataForSync := copyStringMap(sourceDataForCompare)
+		targetBinaryForSync := copyByteMap(sourceBinaryForCompare)
+
+		if targetExists {
+			for key, value := range targetCM.Data {
+				if _, ignored := ignoreKeys[key]; ignored {
+					targetDataForSync[key] = value
+				}
+			}
+			for key, value := range copyByteMap(targetCM.BinaryData) {
+				if _, ignored := ignoreKeys[key]; ignored {
+					targetBinaryForSync[key] = value
+				}
+			}
+		}
+
+		targetCM.Data = targetDataForSync
+		targetCM.BinaryData = targetBinaryForSync
 
 		if targetExists {
 			if err := r.Update(ctx, &targetCM); err != nil {
@@ -253,6 +273,26 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	requeueAfter := withJitter(interval, updater.Namespace+"/"+updater.Name)
 	log.Info("reconcile complete", "changed", changed, "duration", time.Since(start).String(), "nextRequeue", requeueAfter.String())
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func toIgnoreKeySet(ignoreKeys []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(ignoreKeys))
+	for _, key := range ignoreKeys {
+		set[key] = struct{}{}
+	}
+	return set
+}
+
+func filteredConfigMap(data map[string]string, binaryData map[string][]byte, ignoreKeys map[string]struct{}) (map[string]string, map[string][]byte) {
+	filteredData := copyStringMap(data)
+	filteredBinary := copyByteMap(binaryData)
+
+	for key := range ignoreKeys {
+		delete(filteredData, key)
+		delete(filteredBinary, key)
+	}
+
+	return filteredData, filteredBinary
 }
 
 // SetupWithManager sets up the controller with the Manager.

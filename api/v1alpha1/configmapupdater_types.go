@@ -69,6 +69,10 @@ type ConfigMapUpdaterSpec struct {
 	// restartTargets lists deployments to restart on change.
 	// +optional
 	RestartTargets []DeploymentRef `json:"restartTargets,omitempty"`
+
+	// ignoreKeys excludes keys from change detection and sync.
+	// +optional
+	IgnoreKeys []string `json:"ignoreKeys,omitempty"`
 }
 
 // ConfigMapUpdaterStatus defines the observed state of ConfigMapUpdater.
