@@ -1,0 +1,6 @@
+## Append samples of your project ##
+resources:
+- bf-destination-kubeconfig-secret.yaml
+- ops_v1alpha1_destinationcluster.yaml
+- ops_v1alpha1_configmapupdater.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

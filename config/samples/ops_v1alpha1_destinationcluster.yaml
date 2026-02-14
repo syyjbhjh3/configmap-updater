@@ -1,0 +1,12 @@
+apiVersion: ops.ops.example.io/v1alpha1
+kind: DestinationCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: configmap-updater
+    app.kubernetes.io/managed-by: kustomize
+  name: bf-destination
+spec:
+  kubeconfigSecretRef:
+    name: bf-destination-kubeconfig
+    key: kubeconfig
+  pollInterval: 5m

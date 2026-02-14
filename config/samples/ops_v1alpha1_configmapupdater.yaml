@@ -1,0 +1,21 @@
+apiVersion: ops.ops.example.io/v1alpha1
+kind: ConfigMapUpdater
+metadata:
+  labels:
+    app.kubernetes.io/name: configmap-updater
+    app.kubernetes.io/managed-by: kustomize
+  name: viola-cm-updater
+spec:
+  destinationClusterRef:
+    name: bf-destination
+  source:
+    namespace: viola
+    name: viola-config
+  target:
+    namespace: viola
+    name: viola-config
+  interval: 5m
+  restartOnChange: true
+  restartTargets:
+  - namespace: viola
+    name: viola
