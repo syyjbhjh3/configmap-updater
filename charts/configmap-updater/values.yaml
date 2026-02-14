@@ -11,19 +11,3 @@ destinationCluster:
     data: |
       # TODO: 실제 kubeconfig를 넣어주세요.
       <PASTE_KUBECONFIG_HERE>
-
-configMapUpdaters:
-  - name: viola-cm-updater
-    namespace: viola
-    destinationClusterRef: bf-destination
-    source:
-      namespace: viola
-      name: viola-api-env
-    target:
-      namespace: viola
-      name: viola-dev-api-env
-    interval: 5m
-    restartOnChange: true
-    restartTargets:
-      - namespace: viola
-        name: viola
