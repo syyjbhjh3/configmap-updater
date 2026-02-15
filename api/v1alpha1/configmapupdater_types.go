@@ -42,6 +42,51 @@ type DeploymentRef struct {
 	Name string `json:"name"`
 }
 
+type GitSyncSpec struct {
+	// +required
+	// Repo is HTTPS/SSH URL of git repository to update.
+	Repo string `json:"repo"`
+
+	// +optional
+	// Branch is target branch. Defaults to "main".
+	Branch string `json:"branch,omitempty"`
+
+	// +required
+	// FilePath is path in repository to update (e.g. app/values.yaml).
+	FilePath string `json:"filePath"`
+
+	// +optional
+	// SecretRef references secret that has git credentials.
+	// Used when pushing commit to remote git.
+	SecretRef corev1.LocalObjectReference `json:"secretRef,omitempty"`
+}
+
+type ArgoCDSyncSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Name string `json:"name"`
+
+	// Namespace where the ArgoCD Application exists.
+	// +kubebuilder:default:="argocd"
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Poll interval while waiting for ArgoCD Sync.
+	// +kubebuilder:default:="10s"
+	// +optional
+	PollInterval metav1.Duration `json:"pollInterval,omitempty"`
+
+	// Maximum wait time for ArgoCD Sync completion.
+	// +kubebuilder:default:="3m"
+	// +optional
+	Timeout metav1.Duration `json:"timeout,omitempty"`
+
+	// If true, wait for health status to be Healthy in addition to synced.
+	// +kubebuilder:default:=false
+	// +optional
+	RequireHealthy bool `json:"requireHealthy,omitempty"`
+}
+
 // ConfigMapUpdaterSpec defines the desired state of ConfigMapUpdater
 type ConfigMapUpdaterSpec struct {
 	// destinationClusterRef references DestinationCluster used as source cluster.
@@ -55,6 +100,10 @@ type ConfigMapUpdaterSpec struct {
 	// target defines target ConfigMap identity in local cluster.
 	// +required
 	Target ConfigMapRef `json:"target"`
+
+	// git defines git sync settings.
+	// +optional
+	Git *GitSyncSpec `json:"git,omitempty"`
 
 	// interval overrides reconcile interval for this policy.
 	// +kubebuilder:default:="5m"
@@ -73,6 +122,11 @@ type ConfigMapUpdaterSpec struct {
 	// ignoreKeys excludes keys from change detection and sync.
 	// +optional
 	IgnoreKeys []string `json:"ignoreKeys,omitempty"`
+
+	// argocdSync controls optional waiting for ArgoCD Application sync completion
+	// before restarting target deployments.
+	// +optional
+	ArgocdSync *ArgoCDSyncSpec `json:"argocdSync,omitempty"`
 }
 
 // ConfigMapUpdaterStatus defines the observed state of ConfigMapUpdater.

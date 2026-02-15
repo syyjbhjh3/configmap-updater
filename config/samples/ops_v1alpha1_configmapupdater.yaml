@@ -11,6 +11,10 @@ spec:
   source:
     namespace: viola
     name: viola-config
+  git:
+    repo: https://github.com/your-org/config-repo.git
+    branch: main
+    filePath: apps/viola/templates/configmap.yaml
   target:
     namespace: viola
     name: viola-config

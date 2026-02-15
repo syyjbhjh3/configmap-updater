@@ -17,12 +17,21 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"sort"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -30,13 +39,17 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/types"
 	kubernetes "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/yaml"
 
 	opsv1alpha1 "github.com/syyjbhjh3/configmap-updater/api/v1alpha1"
 )
@@ -54,13 +67,14 @@ type ConfigMapUpdaterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=argoproj.io,resources=applications,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ConfigMapUpdater object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
+	// TODO(user): Modify the Reconcile function to compare the state specified by
+	// the ConfigMapUpdater object against the actual cluster state, and then
+	// perform operations to make the cluster state reflect the state specified by
+	// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/reconcile
@@ -137,7 +151,6 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	dest.Status.LastValidatedTime = &nowValidated
 	_ = r.Status().Update(ctx, &dest)
 
-
 	ignoreKeys := toIgnoreKeySet(updater.Spec.IgnoreKeys)
 	sourceDataForCompare, sourceBinaryForCompare := filteredConfigMap(sourceCM.Data, sourceCM.BinaryData, ignoreKeys)
 	sourceHash, err := hashConfigMap(sourceDataForCompare, sourceBinaryForCompare)
@@ -145,99 +158,34 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.failStatus(ctx, &updater, "SourceHashError", err.Error(), interval)
 	}
 
-	targetKey := types.NamespacedName{Namespace: updater.Spec.Target.Namespace, Name: updater.Spec.Target.Name}
-	var targetCM corev1.ConfigMap
-	targetExists := true
-	if err := r.Get(ctx, targetKey, &targetCM); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return r.failStatus(ctx, &updater, "TargetConfigMapReadError", err.Error(), interval)
-		}
-		targetExists = false
+	if updater.Spec.Git == nil {
+		return r.failStatus(ctx, &updater, "InvalidSpec", "spec.git is required", interval)
 	}
 
-	changed := true
+	changed := false
 	action := "noop"
-	if targetExists {
-		targetDataForCompare, targetBinaryForCompare := filteredConfigMap(targetCM.Data, targetCM.BinaryData, ignoreKeys)
-		targetHash, hashErr := hashConfigMap(targetDataForCompare, targetBinaryForCompare)
-		if hashErr != nil {
-			return r.failStatus(ctx, &updater, "TargetHashError", hashErr.Error(), interval)
+	commitHash, changedInGit, err := r.syncConfigMapToGit(ctx, &updater, sourceDataForCompare, sourceBinaryForCompare, ignoreKeys, sourceHash)
+	if err != nil {
+		return r.failStatus(ctx, &updater, "GitSyncError", err.Error(), interval)
+	}
+	changed = changedInGit
+	if changedInGit {
+		action = "updated-git"
+		if commitHash != "" {
+			action = "updated-git-" + commitHash[:7]
 		}
-		changed = targetHash != sourceHash
-		log.Info("configmap compare", "sourceHash", sourceHash, "targetHash", targetHash, "changed", changed)
 	} else {
-		log.Info("target configmap not found, creating", "target", targetKey.String())
+		log.Info("git target already up-to-date; skip update and commit")
 	}
 
-	if changed {
-		action = "updated-configmap"
-		if !targetExists {
-			targetCM = corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      updater.Spec.Target.Name,
-					Namespace: updater.Spec.Target.Namespace,
-				},
+	if changed && updater.Spec.RestartOnChange {
+		if updater.Spec.ArgocdSync != nil && updater.Spec.ArgocdSync.Name != "" {
+			if err := r.waitForArgoCDSync(ctx, &updater, updater.Spec.ArgocdSync); err != nil {
+				return r.failStatus(ctx, &updater, "ArgoCDSyncTimeout", err.Error(), interval)
 			}
 		}
-		if targetCM.Labels == nil {
-			targetCM.Labels = map[string]string{}
-		}
-		targetCM.Labels["app.kubernetes.io/managed-by"] = "configmap-updater"
-		targetCM.Labels["configmap-updater.ops.example.io/policy"] = updater.Name
-		targetDataForSync := copyStringMap(sourceDataForCompare)
-		targetBinaryForSync := copyByteMap(sourceBinaryForCompare)
-
-		if targetExists {
-			for key, value := range targetCM.Data {
-				if _, ignored := ignoreKeys[key]; ignored {
-					targetDataForSync[key] = value
-				}
-			}
-			for key, value := range copyByteMap(targetCM.BinaryData) {
-				if _, ignored := ignoreKeys[key]; ignored {
-					targetBinaryForSync[key] = value
-				}
-			}
-		}
-
-		targetCM.Data = targetDataForSync
-		targetCM.BinaryData = targetBinaryForSync
-
-		if targetExists {
-			if err := r.Update(ctx, &targetCM); err != nil {
-				return r.failStatus(ctx, &updater, "TargetConfigMapUpdateError", err.Error(), interval)
-			}
-		} else {
-			if err := r.Create(ctx, &targetCM); err != nil {
-				return r.failStatus(ctx, &updater, "TargetConfigMapCreateError", err.Error(), interval)
-			}
-		}
-
-		if updater.Spec.RestartOnChange {
-			restarted := false
-			for _, depRef := range updater.Spec.RestartTargets {
-				var dep appsv1.Deployment
-				key := types.NamespacedName{Namespace: depRef.Namespace, Name: depRef.Name}
-				if err := r.Get(ctx, key, &dep); err != nil {
-					log.Error(err, "restart target deployment fetch failed", "deployment", key.String())
-					continue
-				}
-				base := dep.DeepCopy()
-				if dep.Spec.Template.Annotations == nil {
-					dep.Spec.Template.Annotations = map[string]string{}
-				}
-				dep.Spec.Template.Annotations["configmap-updater.ops.example.io/restartedAt"] = time.Now().UTC().Format(time.RFC3339)
-				dep.Spec.Template.Annotations["configmap-updater.ops.example.io/sourceHash"] = sourceHash
-				if err := r.Patch(ctx, &dep, client.MergeFrom(base)); err != nil {
-					log.Error(err, "deployment restart patch failed", "deployment", key.String())
-				} else {
-					log.Info("deployment restart patch applied", "deployment", key.String())
-					restarted = true
-				}
-			}
-			if restarted {
-				action = "updated-configmap-and-restarted"
-			}
+		if err := r.restartDeployments(ctx, &updater); err != nil {
+			return r.failStatus(ctx, &updater, "RestartTargetsError", err.Error(), interval)
 		}
 	} else {
 		log.Info("target already up-to-date; skip update and restart")
@@ -293,6 +241,466 @@ func filteredConfigMap(data map[string]string, binaryData map[string][]byte, ign
 	}
 
 	return filteredData, filteredBinary
+}
+
+func (r *ConfigMapUpdaterReconciler) syncConfigMapToGit(
+	ctx context.Context,
+	updater *opsv1alpha1.ConfigMapUpdater,
+	sourceData map[string]string,
+	sourceBinary map[string][]byte,
+	ignoreKeys map[string]struct{},
+	sourceHash string,
+) (string, bool, error) {
+	if updater == nil || updater.Spec.Git == nil {
+		return "", false, errors.New("git sync spec is required")
+	}
+	spec := updater.Spec.Git
+	if spec.Repo == "" || spec.FilePath == "" {
+		return "", false, errors.New("git spec.repo and spec.filePath are required")
+	}
+
+	branch := spec.Branch
+	if branch == "" {
+		branch = "main"
+	}
+
+	repoDir := filepath.Join(os.TempDir(), "configmap-updater-git", updater.Namespace, updater.Name)
+	_ = os.MkdirAll(filepath.Dir(repoDir), 0o755)
+
+	_ = os.RemoveAll(repoDir)
+	if err := r.cloneOrUpdateRepo(ctx, spec.Repo, branch, repoDir); err != nil {
+		return "", false, err
+	}
+
+	raw, err := os.ReadFile(filepath.Join(repoDir, spec.FilePath))
+	if err != nil {
+		return "", false, fmt.Errorf("read target file: %w", err)
+	}
+	docs, err := decodeYAMLDocuments(raw)
+	if err != nil {
+		return "", false, fmt.Errorf("decode target yaml: %w", err)
+	}
+
+	targetNode, exists := findConfigMapNode(docs, updater.Spec.Target.Name, updater.Spec.Target.Namespace)
+	var existingData map[string]string
+	var existingBinary map[string][]byte
+	if exists {
+		existingData, existingBinary = extractConfigMapData(targetNode)
+		filteredData, filteredBinary := filteredConfigMap(existingData, existingBinary, ignoreKeys)
+		existingHash, err := hashConfigMap(filteredData, filteredBinary)
+		if err != nil {
+			return "", false, fmt.Errorf("target configmap hash error: %w", err)
+		}
+		if existingHash == sourceHash {
+			return "", false, nil
+		}
+	}
+
+	nextData := copyStringMap(sourceData)
+	nextBinary := copyByteMap(sourceBinary)
+	if exists {
+		for key := range ignoreKeys {
+			if value, ok := existingData[key]; ok {
+				nextData[key] = value
+			}
+			if value, ok := existingBinary[key]; ok {
+				nextBinary[key] = value
+			}
+		}
+	}
+
+	docs, targetNode = ensureConfigMapNode(targetNode, docs, updater.Spec.Target.Name, updater.Spec.Target.Namespace)
+	targetNode["data"] = convertDataMapToInterface(nextData)
+	targetNode["binaryData"] = convertBinaryMapToInterface(nextBinary)
+	out, err := encodeYAMLDocuments(docs)
+	if err != nil {
+		return "", false, fmt.Errorf("marshal updated yaml: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, spec.FilePath), out, 0o644); err != nil {
+		return "", false, fmt.Errorf("write target file: %w", err)
+	}
+
+	changed, err := hasFileChanged(ctx, repoDir, spec.FilePath)
+	if err != nil {
+		return "", false, err
+	}
+	if !changed {
+		return "", false, nil
+	}
+
+	commitHash, err := pushGitCommit(ctx, repoDir, spec, updater.Spec.Source.Namespace, updater.Spec.Source.Name, sourceHash)
+	if err != nil {
+		return "", false, err
+	}
+	return commitHash, true, nil
+}
+
+func pushGitCommit(
+	ctx context.Context,
+	repoDir string,
+	spec *opsv1alpha1.GitSyncSpec,
+	sourceNS, sourceName, sourceHash string,
+) (string, error) {
+	cmdName := func(args ...string) (*exec.Cmd, error) {
+		if len(args) == 0 {
+			return nil, errors.New("empty git command")
+		}
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = repoDir
+		return cmd, nil
+	}
+
+	cmd, err := cmdName("add", spec.FilePath)
+	if err != nil {
+		return "", err
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git add: %s: %w", out, err)
+	}
+
+	msg := fmt.Sprintf("chore: sync configmap from %s/%s", sourceNS, sourceName)
+	if sourceHash != "" {
+		msg = fmt.Sprintf("%s (sourceHash=%s)", msg, sourceHash)
+	}
+	cmd = exec.CommandContext(
+		ctx,
+		"git",
+		"-c", "user.name=configmap-updater",
+		"-c", "user.email=configmap-updater@local",
+		"commit",
+		"-m", msg,
+		"--",
+		spec.FilePath,
+	)
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git commit: %s: %w", out, err)
+	}
+
+	branch := spec.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	cmd = exec.CommandContext(ctx, "git", "push", "origin", branch)
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git push: %s: %w", out, err)
+	}
+	cmd = exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
+	cmd.Dir = repoDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func hasFileChanged(ctx context.Context, repoDir, filePath string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", filePath)
+	cmd.Dir = repoDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("git status: %s: %w", out, err)
+	}
+	return len(out) > 0, nil
+}
+
+func (r *ConfigMapUpdaterReconciler) waitForArgoCDSync(
+	ctx context.Context,
+	updater *opsv1alpha1.ConfigMapUpdater,
+	spec *opsv1alpha1.ArgoCDSyncSpec,
+) error {
+	if updater == nil || spec == nil || spec.Name == "" {
+		return nil
+	}
+
+	namespace := spec.Namespace
+	if namespace == "" {
+		namespace = "argocd"
+	}
+
+	log := logf.FromContext(ctx).WithValues(
+		"configMapUpdater", fmt.Sprintf("%s/%s", updater.Namespace, updater.Name),
+		"argocdApplication", fmt.Sprintf("%s/%s", namespace, spec.Name),
+	)
+
+	pollInterval := 10 * time.Second
+	if spec.PollInterval.Duration > 0 {
+		pollInterval = spec.PollInterval.Duration
+	}
+	if pollInterval < time.Second {
+		pollInterval = time.Second
+	}
+
+	timeout := 3 * time.Minute
+	if spec.Timeout.Duration > 0 {
+		timeout = spec.Timeout.Duration
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	appObj := &unstructured.Unstructured{}
+	appObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "argoproj.io",
+		Version: "v1alpha1",
+		Kind:    "Application",
+	})
+
+	for {
+		err := r.Get(waitCtx, types.NamespacedName{Namespace: namespace, Name: spec.Name}, appObj)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("argocd application %s/%s not found", namespace, spec.Name)
+			}
+			log.Error(err, "failed to get argocd application")
+		} else {
+			syncStatus, _, _ := unstructured.NestedString(appObj.Object, "status", "sync", "status")
+			healthStatus, _, _ := unstructured.NestedString(appObj.Object, "status", "health", "status")
+
+			if syncStatus == "Synced" && (!spec.RequireHealthy || healthStatus == "Healthy") {
+				log.Info("argocd application synced", "syncStatus", syncStatus, "healthStatus", healthStatus)
+				return nil
+			}
+
+			log.Info("waiting for argocd sync", "syncStatus", syncStatus, "healthStatus", healthStatus)
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timeout waiting argocd sync for %s/%s", namespace, spec.Name)
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+func (r *ConfigMapUpdaterReconciler) restartDeployments(ctx context.Context, updater *opsv1alpha1.ConfigMapUpdater) error {
+	if updater == nil {
+		return nil
+	}
+	if len(updater.Spec.RestartTargets) == 0 {
+		return nil
+	}
+	restartAt := time.Now().Format(time.RFC3339)
+	for _, target := range updater.Spec.RestartTargets {
+		var dep appsv1.Deployment
+		if err := r.Get(ctx, types.NamespacedName{
+			Namespace: target.Namespace,
+			Name:      target.Name,
+		}, &dep); err != nil {
+			return err
+		}
+		patch := map[string]interface{}{
+			"spec": map[string]interface{}{
+				"template": map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"annotations": map[string]string{
+							"kubectl.kubernetes.io/restartedAt": restartAt,
+						},
+					},
+				},
+			},
+		}
+		raw, err := json.Marshal(patch)
+		if err != nil {
+			return err
+		}
+		if err := r.Patch(ctx, &dep, client.RawPatch(types.StrategicMergePatchType, raw)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func decodeYAMLDocuments(raw []byte) ([]interface{}, error) {
+	decoder := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), 1024)
+	docs := make([]interface{}, 0)
+	for {
+		var doc interface{}
+		if err := decoder.Decode(&doc); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		if doc != nil {
+			docs = append(docs, doc)
+		}
+	}
+	return docs, nil
+}
+
+func encodeYAMLDocuments(docs []interface{}) ([]byte, error) {
+	if len(docs) == 0 {
+		return []byte{}, nil
+	}
+	var out strings.Builder
+	for i, doc := range docs {
+		if i > 0 {
+			out.WriteString("---\n")
+		}
+		raw, err := yaml.Marshal(doc)
+		if err != nil {
+			return nil, err
+		}
+		out.Write(raw)
+		if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+			out.WriteByte('\n')
+		}
+	}
+	return []byte(out.String()), nil
+}
+
+func findConfigMapNode(docs []interface{}, targetName, targetNamespace string) (map[string]interface{}, bool) {
+	for _, doc := range docs {
+		if node, found := findConfigMapNodeInObject(doc, targetName, targetNamespace); found {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+func findConfigMapNodeInObject(obj interface{}, targetName, targetNamespace string) (map[string]interface{}, bool) {
+	switch typed := obj.(type) {
+	case map[string]interface{}:
+		kind, _ := typed["kind"].(string)
+		metadata, _ := typed["metadata"].(map[string]interface{})
+		name, _ := metadata["name"].(string)
+		namespace, _ := metadata["namespace"].(string)
+		if kind == "ConfigMap" && name == targetName && (namespace == "" || namespace == targetNamespace) {
+			return typed, true
+		}
+		if nested, ok := typed["items"].([]interface{}); ok {
+			if node, found := findConfigMapNodeInObject(nested, targetName, targetNamespace); found {
+				return node, true
+			}
+		}
+		for _, key := range []string{"spec", "items"} {
+			if child, ok := typed[key]; ok {
+				if node, found := findConfigMapNodeInObject(child, targetName, targetNamespace); found {
+					return node, true
+				}
+			}
+		}
+	case []interface{}:
+		for _, item := range typed {
+			if node, found := findConfigMapNodeInObject(item, targetName, targetNamespace); found {
+				return node, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func ensureConfigMapNode(
+	existing map[string]interface{},
+	docs []interface{},
+	targetName, targetNamespace string,
+) ([]interface{}, map[string]interface{}) {
+	if existing != nil {
+		return docs, existing
+	}
+	newNode := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      targetName,
+			"namespace": targetNamespace,
+		},
+	}
+	docs = append(docs, newNode)
+	return docs, newNode
+}
+
+func extractConfigMapData(node map[string]interface{}) (map[string]string, map[string][]byte) {
+	dataMap, err := asStringMap(node["data"])
+	if err != nil {
+		dataMap = map[string]string{}
+	}
+	binaryMap, err := asBase64Map(node["binaryData"])
+	if err != nil {
+		binaryMap = map[string][]byte{}
+	}
+	return dataMap, binaryMap
+}
+
+func asStringMap(raw interface{}) (map[string]string, error) {
+	if raw == nil {
+		return map[string]string{}, nil
+	}
+	typed, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, errors.New("invalid yaml map data")
+	}
+	result := make(map[string]string, len(typed))
+	for key, value := range typed {
+		text, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid value for key=%s", key)
+		}
+		result[key] = text
+	}
+	return result, nil
+}
+
+func asBase64Map(raw interface{}) (map[string][]byte, error) {
+	rawMap, err := asStringMap(raw)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]byte, len(rawMap))
+	for key, value := range rawMap {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 data for key=%s", key)
+		}
+		result[key] = decoded
+	}
+	return result, nil
+}
+
+func convertDataMapToInterface(data map[string]string) map[string]interface{} {
+	if data == nil {
+		return map[string]interface{}{}
+	}
+	result := make(map[string]interface{}, len(data))
+	for key, value := range data {
+		result[key] = value
+	}
+	return result
+}
+
+func convertBinaryMapToInterface(binary map[string][]byte) map[string]interface{} {
+	if binary == nil {
+		return map[string]interface{}{}
+	}
+	keys := make([]string, 0, len(binary))
+	for key := range binary {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make(map[string]interface{}, len(binary))
+	for _, key := range keys {
+		result[key] = base64.StdEncoding.EncodeToString(binary[key])
+	}
+	return result
+}
+
+func (r *ConfigMapUpdaterReconciler) cloneOrUpdateRepo(ctx context.Context, repository, branch, repoDir string) error {
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", branch, "--single-branch", repository, repoDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git clone: %s: %w", output, err)
+	}
+	cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "pull", "origin", branch)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git pull: %s: %w", output, err)
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

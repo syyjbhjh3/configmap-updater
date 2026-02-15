@@ -66,10 +66,19 @@ kubectl apply -k config/samples
 2. 참조된 `DestinationCluster`를 해석합니다.
 3. Secret에서 kubeconfig를 읽어 원격 클라이언트를 구성합니다.
 4. 원격 소스 ConfigMap을 읽기 전용으로 조회합니다.
-5. source/target 내용을 비교합니다(hash/data/binaryData).
-6. 변경이 있으면 로컬 target ConfigMap을 업데이트합니다.
-7. `restartOnChange`가 활성화되어 있으면 지정된 Deployment를 patch해 롤링 재시작을 유도합니다.
-8. status/conditions를 갱신하고 주기에 맞춰 재큐잉합니다.
+5. 소스/이전 대상 내용을 비교합니다(hash/data/binaryData, ignoreKeys 적용).
+6. 변경이 있으면 git 대상 파일에서 target ConfigMap 노드를 찾아 `data`/`binaryData`를 갱신합니다.
+7. 갱신 파일을 commit/push 합니다.
+8. `restartOnChange`가 활성화되어 있으면 지정된 Deployment를 patch해 롤링 재시작을 유도합니다.
+9. status/conditions를 갱신하고 주기에 맞춰 재큐잉합니다.
+
+## Git 동기화 동작 정리
+
+- `spec.git`는 `repo/branch/filePath`를 필수/선택값으로 받습니다.
+- 대상 파일 내 `metadata.name`, `metadata.namespace`가 `spec.target`과 일치하는 ConfigMap 노드를 탐색합니다.
+- target 노드가 없으면 새로 생성해 넣습니다.
+- ignoreKeys는 compare/merge에서 제외/보존 대상으로 처리합니다.
+- 커밋 메시지와 author는 내부 기본값으로 고정 처리합니다.
 
 ## 사용 기술
 
