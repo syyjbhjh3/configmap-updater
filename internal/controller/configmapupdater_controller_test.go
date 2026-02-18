@@ -82,7 +82,7 @@ var _ = Describe("ConfigMapUpdater Controller", func() {
 						Namespace: "default",
 					},
 					Spec: opsv1alpha1.ConfigMapUpdaterSpec{
-						DestinationClusterRef: corev1.LocalObjectReference{Name: "test-destination"},
+						DestinationClusterRef: opsv1alpha1.DestinationClusterReference{Name: "test-destination"},
 						Source: opsv1alpha1.ConfigMapRef{
 							Namespace: "viola",
 							Name:      "viola-config",

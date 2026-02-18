@@ -6,10 +6,12 @@
 
 - `DestinationCluster`
   - `spec.kubeconfigSecretRef`(`Secret` key)로 원격 kubeconfig를 참조
+  - `spec.kubeconfigSecretNamespace`로 kubeconfig Secret namespace를 선택적으로 분리 가능
   - `spec.pollInterval`로 기본 폴링 주기 정의
 - `ConfigMapUpdater`
-  - `DestinationCluster`를 참조
+  - `destinationClusterRef.name`(+ optional `destinationClusterRef.namespace`)로 `DestinationCluster` 참조
   - source/target ConfigMap 식별 정보 정의
+  - `spec.git.secretRef`로 Git 인증 Secret(HTTPS username/password 또는 token, SSH key) 사용 가능
   - ConfigMap 변경 시 대상 Deployment 재시작(선택)
 
 ## Safety
@@ -75,6 +77,9 @@ kubectl apply -k config/samples
 ## Git 동기화 동작 정리
 
 - `spec.git`는 `repo/branch/filePath`를 필수/선택값으로 받습니다.
+- `spec.git.secretRef` 지정 시 아래 key를 인식합니다.
+  - HTTPS: `username` + `password` 또는 `token`
+  - SSH: `sshPrivateKey` (+ optional `knownHosts`)
 - 대상 파일 내 `metadata.name`, `metadata.namespace`가 `spec.target`과 일치하는 ConfigMap 노드를 탐색합니다.
 - target 노드가 없으면 새로 생성해 넣습니다.
 - ignoreKeys는 compare/merge에서 제외/보존 대상으로 처리합니다.

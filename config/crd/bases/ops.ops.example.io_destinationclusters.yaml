@@ -47,6 +47,11 @@ spec:
           spec:
             description: spec defines the desired state of DestinationCluster
             properties:
+              kubeconfigSecretNamespace:
+                description: |-
+                  kubeconfigSecretNamespace overrides namespace of kubeconfig Secret.
+                  Defaults to this DestinationCluster namespace when omitted.
+                type: string
               kubeconfigSecretRef:
                 description: kubeconfigSecretRef references a Secret key containing
                   destination cluster kubeconfig.

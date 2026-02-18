@@ -52,21 +52,86 @@ spec:
           spec:
             description: spec defines the desired state of ConfigMapUpdater
             properties:
+              argocdSync:
+                description: |-
+                  argocdSync controls optional waiting for ArgoCD Application sync completion
+                  before restarting target deployments.
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                  namespace:
+                    default: argocd
+                    description: Namespace where the ArgoCD Application exists.
+                    type: string
+                  pollInterval:
+                    default: 10s
+                    description: Poll interval while waiting for ArgoCD Sync.
+                    type: string
+                  requireHealthy:
+                    default: false
+                    description: If true, wait for health status to be Healthy in
+                      addition to synced.
+                    type: boolean
+                  timeout:
+                    default: 3m
+                    description: Maximum wait time for ArgoCD Sync completion.
+                    type: string
+                required:
+                - name
+                type: object
               destinationClusterRef:
                 description: destinationClusterRef references DestinationCluster used
                   as source cluster.
                 properties:
                   name:
-                    default: ""
-                    description: |-
-                      Name of the referent.
-                      This field is effectively required, but due to backwards compatibility is
-                      allowed to be empty. Instances of this type with an empty value here are
-                      almost certainly wrong.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    minLength: 1
                     type: string
+                  namespace:
+                    description: |-
+                      Namespace of DestinationCluster.
+                      Defaults to this ConfigMapUpdater namespace when omitted.
+                    type: string
+                required:
+                - name
                 type: object
-                x-kubernetes-map-type: atomic
+              git:
+                description: git defines git sync settings.
+                properties:
+                  branch:
+                    description: Branch is target branch. Defaults to "main".
+                    type: string
+                  filePath:
+                    description: FilePath is path in repository to update (e.g. app/values.yaml).
+                    type: string
+                  repo:
+                    description: Repo is HTTPS/SSH URL of git repository to update.
+                    type: string
+                  secretRef:
+                    description: |-
+                      SecretRef references secret that has git credentials.
+                      Used when pushing commit to remote git.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - filePath
+                - repo
+                type: object
+              ignoreKeys:
+                description: ignoreKeys excludes keys from change detection and sync.
+                items:
+                  type: string
+                type: array
               interval:
                 default: 5m
                 description: interval overrides reconcile interval for this policy.
@@ -90,11 +155,6 @@ spec:
                   - name
                   - namespace
                   type: object
-                type: array
-              ignoreKeys:
-                description: ignoreKeys excludes keys from change detection and sync.
-                items:
-                  type: string
                 type: array
               source:
                 description: source defines source ConfigMap identity in destination

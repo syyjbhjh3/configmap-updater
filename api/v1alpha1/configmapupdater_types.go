@@ -42,6 +42,17 @@ type DeploymentRef struct {
 	Name string `json:"name"`
 }
 
+type DestinationClusterReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Name string `json:"name"`
+
+	// Namespace of DestinationCluster.
+	// Defaults to this ConfigMapUpdater namespace when omitted.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
 type GitSyncSpec struct {
 	// +required
 	// Repo is HTTPS/SSH URL of git repository to update.
@@ -91,7 +102,7 @@ type ArgoCDSyncSpec struct {
 type ConfigMapUpdaterSpec struct {
 	// destinationClusterRef references DestinationCluster used as source cluster.
 	// +required
-	DestinationClusterRef corev1.LocalObjectReference `json:"destinationClusterRef"`
+	DestinationClusterRef DestinationClusterReference `json:"destinationClusterRef"`
 
 	// source defines source ConfigMap identity in destination cluster.
 	// +required

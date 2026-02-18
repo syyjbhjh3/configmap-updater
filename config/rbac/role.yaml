@@ -33,6 +33,14 @@ rules:
   - patch
   - watch
 - apiGroups:
+  - argoproj.io
+  resources:
+  - applications
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - ops.ops.example.io
   resources:
   - configmapupdaters
@@ -62,14 +70,6 @@ rules:
   - ops.ops.example.io
   resources:
   - destinationclusters
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - argoproj.io
-  resources:
-  - applications
   verbs:
   - get
   - list

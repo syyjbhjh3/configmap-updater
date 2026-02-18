@@ -30,6 +30,11 @@ type DestinationClusterSpec struct {
 	// +required
 	KubeconfigSecretRef corev1.SecretKeySelector `json:"kubeconfigSecretRef"`
 
+	// kubeconfigSecretNamespace overrides namespace of kubeconfig Secret.
+	// Defaults to this DestinationCluster namespace when omitted.
+	// +optional
+	KubeconfigSecretNamespace string `json:"kubeconfigSecretNamespace,omitempty"`
+
 	// pollInterval is the base reconcile interval for policies using this destination cluster.
 	// +kubebuilder:default:="5m"
 	// +optional

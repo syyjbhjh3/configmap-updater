@@ -27,10 +27,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"sort"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,13 +42,15 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/types"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	kubernetes "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
 	opsv1alpha1 "github.com/syyjbhjh3/configmap-updater/api/v1alpha1"
@@ -59,6 +61,18 @@ type ConfigMapUpdaterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
+
+const (
+	updaterByDestinationClusterKey              = ".spec.destinationClusterRef"
+	updaterByGitSecretKey                       = ".spec.git.secretRef"
+	destinationClusterByKubeconfigSecretNameKey = ".spec.kubeconfigSecretRef.name"
+	destinationClusterByKubeconfigSecretNSKey   = ".spec.kubeconfigSecretNamespace"
+	gitSecretUsernameKey                        = "username"
+	gitSecretPasswordKey                        = "password"
+	gitSecretTokenKey                           = "token"
+	gitSecretSSHPrivateKeyKey                   = "sshPrivateKey"
+	gitSecretKnownHostsKey                      = "knownHosts"
+)
 
 // +kubebuilder:rbac:groups=ops.ops.example.io,resources=configmapupdaters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ops.ops.example.io,resources=configmapupdaters/status,verbs=get;update;patch
@@ -71,10 +85,10 @@ type ConfigMapUpdaterReconciler struct {
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-	// TODO(user): Modify the Reconcile function to compare the state specified by
-	// the ConfigMapUpdater object against the actual cluster state, and then
-	// perform operations to make the cluster state reflect the state specified by
-	// the user.
+// TODO(user): Modify the Reconcile function to compare the state specified by
+// the ConfigMapUpdater object against the actual cluster state, and then
+// perform operations to make the cluster state reflect the state specified by
+// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/reconcile
@@ -108,7 +122,11 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.failStatus(ctx, &updater, "InvalidSpec", "target namespace/name is required", interval)
 	}
 
-	destKey := types.NamespacedName{Namespace: updater.Namespace, Name: updater.Spec.DestinationClusterRef.Name}
+	destNamespace := updater.Spec.DestinationClusterRef.Namespace
+	if destNamespace == "" {
+		destNamespace = updater.Namespace
+	}
+	destKey := types.NamespacedName{Namespace: destNamespace, Name: updater.Spec.DestinationClusterRef.Name}
 	var dest opsv1alpha1.DestinationCluster
 	if err := r.Get(ctx, destKey, &dest); err != nil {
 		return r.failStatus(ctx, &updater, "DestinationClusterNotFound", err.Error(), interval)
@@ -122,7 +140,11 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	var secret corev1.Secret
-	secretKey := types.NamespacedName{Namespace: updater.Namespace, Name: dest.Spec.KubeconfigSecretRef.Name}
+	secretNamespace := dest.Spec.KubeconfigSecretNamespace
+	if secretNamespace == "" {
+		secretNamespace = dest.Namespace
+	}
+	secretKey := types.NamespacedName{Namespace: secretNamespace, Name: dest.Spec.KubeconfigSecretRef.Name}
 	if err := r.Get(ctx, secretKey, &secret); err != nil {
 		return r.failStatus(ctx, &updater, "KubeconfigSecretNotFound", err.Error(), interval)
 	}
@@ -264,11 +286,17 @@ func (r *ConfigMapUpdaterReconciler) syncConfigMapToGit(
 		branch = "main"
 	}
 
+	gitEnv, cleanupGitAuth, err := r.buildGitCommandEnv(ctx, updater, spec)
+	if err != nil {
+		return "", false, err
+	}
+	defer cleanupGitAuth()
+
 	repoDir := filepath.Join(os.TempDir(), "configmap-updater-git", updater.Namespace, updater.Name)
 	_ = os.MkdirAll(filepath.Dir(repoDir), 0o755)
 
 	_ = os.RemoveAll(repoDir)
-	if err := r.cloneOrUpdateRepo(ctx, spec.Repo, branch, repoDir); err != nil {
+	if err := r.cloneOrUpdateRepo(ctx, spec.Repo, branch, repoDir, gitEnv); err != nil {
 		return "", false, err
 	}
 
@@ -320,7 +348,7 @@ func (r *ConfigMapUpdaterReconciler) syncConfigMapToGit(
 		return "", false, fmt.Errorf("write target file: %w", err)
 	}
 
-	changed, err := hasFileChanged(ctx, repoDir, spec.FilePath)
+	changed, err := hasFileChanged(ctx, repoDir, spec.FilePath, gitEnv)
 	if err != nil {
 		return "", false, err
 	}
@@ -328,7 +356,7 @@ func (r *ConfigMapUpdaterReconciler) syncConfigMapToGit(
 		return "", false, nil
 	}
 
-	commitHash, err := pushGitCommit(ctx, repoDir, spec, updater.Spec.Source.Namespace, updater.Spec.Source.Name, sourceHash)
+	commitHash, err := pushGitCommit(ctx, repoDir, spec, updater.Spec.Source.Namespace, updater.Spec.Source.Name, sourceHash, gitEnv)
 	if err != nil {
 		return "", false, err
 	}
@@ -340,21 +368,9 @@ func pushGitCommit(
 	repoDir string,
 	spec *opsv1alpha1.GitSyncSpec,
 	sourceNS, sourceName, sourceHash string,
+	gitEnv []string,
 ) (string, error) {
-	cmdName := func(args ...string) (*exec.Cmd, error) {
-		if len(args) == 0 {
-			return nil, errors.New("empty git command")
-		}
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = repoDir
-		return cmd, nil
-	}
-
-	cmd, err := cmdName("add", spec.FilePath)
-	if err != nil {
-		return "", err
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runGitCommand(ctx, repoDir, gitEnv, "add", spec.FilePath); err != nil {
 		return "", fmt.Errorf("git add: %s: %w", out, err)
 	}
 
@@ -362,18 +378,17 @@ func pushGitCommit(
 	if sourceHash != "" {
 		msg = fmt.Sprintf("%s (sourceHash=%s)", msg, sourceHash)
 	}
-	cmd = exec.CommandContext(
+	if out, err := runGitCommand(
 		ctx,
-		"git",
+		repoDir,
+		gitEnv,
 		"-c", "user.name=configmap-updater",
 		"-c", "user.email=configmap-updater@local",
 		"commit",
 		"-m", msg,
 		"--",
 		spec.FilePath,
-	)
-	cmd.Dir = repoDir
-	if out, err := cmd.CombinedOutput(); err != nil {
+	); err != nil {
 		return "", fmt.Errorf("git commit: %s: %w", out, err)
 	}
 
@@ -381,24 +396,18 @@ func pushGitCommit(
 	if branch == "" {
 		branch = "main"
 	}
-	cmd = exec.CommandContext(ctx, "git", "push", "origin", branch)
-	cmd.Dir = repoDir
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runGitCommand(ctx, repoDir, gitEnv, "push", "origin", branch); err != nil {
 		return "", fmt.Errorf("git push: %s: %w", out, err)
 	}
-	cmd = exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
-	cmd.Dir = repoDir
-	out, err := cmd.CombinedOutput()
+	out, err := runGitCommand(ctx, repoDir, gitEnv, "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-func hasFileChanged(ctx context.Context, repoDir, filePath string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", filePath)
-	cmd.Dir = repoDir
-	out, err := cmd.CombinedOutput()
+func hasFileChanged(ctx context.Context, repoDir, filePath string, gitEnv []string) (bool, error) {
+	out, err := runGitCommand(ctx, repoDir, gitEnv, "status", "--porcelain", filePath)
 	if err != nil {
 		return false, fmt.Errorf("git status: %s: %w", out, err)
 	}
@@ -689,26 +698,300 @@ func convertBinaryMapToInterface(binary map[string][]byte) map[string]interface{
 	return result
 }
 
-func (r *ConfigMapUpdaterReconciler) cloneOrUpdateRepo(ctx context.Context, repository, branch, repoDir string) error {
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", branch, "--single-branch", repository, repoDir)
-	output, err := cmd.CombinedOutput()
+func (r *ConfigMapUpdaterReconciler) cloneOrUpdateRepo(ctx context.Context, repository, branch, repoDir string, gitEnv []string) error {
+	output, err := runGitCommand(ctx, "", gitEnv, "clone", "--depth", "1", "--branch", branch, "--single-branch", repository, repoDir)
 	if err != nil {
 		return fmt.Errorf("git clone: %s: %w", output, err)
 	}
-	cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "pull", "origin", branch)
-	output, err = cmd.CombinedOutput()
+	output, err = runGitCommand(ctx, repoDir, gitEnv, "pull", "origin", branch)
 	if err != nil {
 		return fmt.Errorf("git pull: %s: %w", output, err)
 	}
 	return nil
 }
 
+func runGitCommand(ctx context.Context, repoDir string, gitEnv []string, args ...string) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, errors.New("empty git command")
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if repoDir != "" {
+		cmd.Dir = repoDir
+	}
+	if len(gitEnv) > 0 {
+		cmd.Env = append(os.Environ(), gitEnv...)
+	}
+	return cmd.CombinedOutput()
+}
+
+func (r *ConfigMapUpdaterReconciler) buildGitCommandEnv(
+	ctx context.Context,
+	updater *opsv1alpha1.ConfigMapUpdater,
+	spec *opsv1alpha1.GitSyncSpec,
+) ([]string, func(), error) {
+	if updater == nil || spec == nil || spec.SecretRef.Name == "" {
+		return nil, func() {}, nil
+	}
+
+	secretKey := types.NamespacedName{Namespace: updater.Namespace, Name: spec.SecretRef.Name}
+	var secret corev1.Secret
+	if err := r.Get(ctx, secretKey, &secret); err != nil {
+		return nil, func() {}, fmt.Errorf("get git credentials secret %s: %w", secretKey.String(), err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "configmap-updater-git-auth-*")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("create git auth tempdir: %w", err)
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tmpDir)
+	}
+
+	env := make([]string, 0, 8)
+	configured := false
+
+	username := secretStringValue(&secret, gitSecretUsernameKey)
+	password := secretStringValue(&secret, gitSecretPasswordKey)
+	token := secretStringValue(&secret, gitSecretTokenKey)
+	if token != "" && password == "" {
+		password = token
+	}
+	if password != "" && username == "" {
+		username = "x-access-token"
+	}
+	if username != "" || password != "" {
+		if username == "" || password == "" {
+			cleanup()
+			return nil, func() {}, errors.New("git credentials secret requires both username and password (or token)")
+		}
+		askPassPath := filepath.Join(tmpDir, "askpass.sh")
+		askPassScript := []byte("#!/bin/sh\ncase \"$1\" in\n*Username*) printf '%s\\n' \"$GIT_HTTP_USERNAME\" ;;\n*Password*) printf '%s\\n' \"$GIT_HTTP_PASSWORD\" ;;\n*) printf '\\n' ;;\nesac\n")
+		if err := os.WriteFile(askPassPath, askPassScript, 0o700); err != nil {
+			cleanup()
+			return nil, func() {}, fmt.Errorf("write git askpass script: %w", err)
+		}
+		env = append(env,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ASKPASS="+askPassPath,
+			"GIT_HTTP_USERNAME="+username,
+			"GIT_HTTP_PASSWORD="+password,
+		)
+		configured = true
+	}
+
+	privateKey := secretStringValue(&secret, gitSecretSSHPrivateKeyKey)
+	if privateKey != "" {
+		privateKeyPath := filepath.Join(tmpDir, "id_rsa")
+		if err := os.WriteFile(privateKeyPath, []byte(privateKey), 0o600); err != nil {
+			cleanup()
+			return nil, func() {}, fmt.Errorf("write git ssh private key: %w", err)
+		}
+
+		sshCommand := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes", shellQuote(privateKeyPath))
+		knownHosts := secretStringValue(&secret, gitSecretKnownHostsKey)
+		if knownHosts != "" {
+			knownHostsPath := filepath.Join(tmpDir, "known_hosts")
+			if err := os.WriteFile(knownHostsPath, []byte(knownHosts), 0o600); err != nil {
+				cleanup()
+				return nil, func() {}, fmt.Errorf("write git known_hosts: %w", err)
+			}
+			sshCommand = fmt.Sprintf(
+				"%s -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes",
+				sshCommand,
+				shellQuote(knownHostsPath),
+			)
+		} else {
+			sshCommand = sshCommand + " -o StrictHostKeyChecking=accept-new"
+		}
+
+		env = append(env, "GIT_SSH_COMMAND="+sshCommand)
+		configured = true
+	}
+
+	if !configured {
+		cleanup()
+		return nil, func() {}, fmt.Errorf(
+			"git credentials secret %s does not contain supported keys (%s/%s or %s, optional %s)",
+			secretKey.String(),
+			gitSecretUsernameKey,
+			gitSecretPasswordKey,
+			gitSecretTokenKey,
+			gitSecretSSHPrivateKeyKey,
+		)
+	}
+	return env, cleanup, nil
+}
+
+func secretStringValue(secret *corev1.Secret, key string) string {
+	if secret == nil || key == "" {
+		return ""
+	}
+	value, ok := secret.Data[key]
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(string(value))
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ConfigMapUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &opsv1alpha1.ConfigMapUpdater{}, updaterByDestinationClusterKey, func(rawObj client.Object) []string {
+		updater, ok := rawObj.(*opsv1alpha1.ConfigMapUpdater)
+		if !ok {
+			return nil
+		}
+		destNamespace := updater.Spec.DestinationClusterRef.Namespace
+		if destNamespace == "" {
+			destNamespace = updater.Namespace
+		}
+		key := namespacedObjectKey(destNamespace, updater.Spec.DestinationClusterRef.Name)
+		if key == "" {
+			return nil
+		}
+		return []string{key}
+	}); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &opsv1alpha1.ConfigMapUpdater{}, updaterByGitSecretKey, func(rawObj client.Object) []string {
+		updater, ok := rawObj.(*opsv1alpha1.ConfigMapUpdater)
+		if !ok || updater.Spec.Git == nil || updater.Spec.Git.SecretRef.Name == "" {
+			return nil
+		}
+		key := namespacedObjectKey(updater.Namespace, updater.Spec.Git.SecretRef.Name)
+		if key == "" {
+			return nil
+		}
+		return []string{key}
+	}); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &opsv1alpha1.DestinationCluster{}, destinationClusterByKubeconfigSecretNameKey, func(rawObj client.Object) []string {
+		dest, ok := rawObj.(*opsv1alpha1.DestinationCluster)
+		if !ok || dest.Spec.KubeconfigSecretRef.Name == "" {
+			return nil
+		}
+		return []string{dest.Spec.KubeconfigSecretRef.Name}
+	}); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &opsv1alpha1.DestinationCluster{}, destinationClusterByKubeconfigSecretNSKey, func(rawObj client.Object) []string {
+		dest, ok := rawObj.(*opsv1alpha1.DestinationCluster)
+		if !ok {
+			return nil
+		}
+		secretNamespace := dest.Spec.KubeconfigSecretNamespace
+		if secretNamespace == "" {
+			secretNamespace = dest.Namespace
+		}
+		if secretNamespace == "" {
+			return nil
+		}
+		return []string{secretNamespace}
+	}); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&opsv1alpha1.ConfigMapUpdater{}).
+		Watches(&opsv1alpha1.DestinationCluster{}, handler.EnqueueRequestsFromMapFunc(r.mapDestinationClusterToUpdaters)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapSecretToUpdaters)).
 		Named("configmapupdater").
 		Complete(r)
+}
+
+func (r *ConfigMapUpdaterReconciler) mapDestinationClusterToUpdaters(ctx context.Context, rawObj client.Object) []reconcile.Request {
+	dest, ok := rawObj.(*opsv1alpha1.DestinationCluster)
+	if !ok {
+		return nil
+	}
+	destKey := namespacedObjectKey(dest.Namespace, dest.Name)
+	if destKey == "" {
+		return nil
+	}
+	var updaters opsv1alpha1.ConfigMapUpdaterList
+	if err := r.List(ctx, &updaters, client.MatchingFields{updaterByDestinationClusterKey: destKey}); err != nil {
+		logf.FromContext(ctx).Error(err, "failed to list ConfigMapUpdaters by destination cluster", "destinationCluster", destKey)
+		return nil
+	}
+	return requestsForUpdaters(updaters.Items)
+}
+
+func (r *ConfigMapUpdaterReconciler) mapSecretToUpdaters(ctx context.Context, rawObj client.Object) []reconcile.Request {
+	secret, ok := rawObj.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	log := logf.FromContext(ctx)
+	requestsByName := make(map[types.NamespacedName]struct{})
+
+	var updatersByGitSecret opsv1alpha1.ConfigMapUpdaterList
+	secretKey := namespacedObjectKey(secret.Namespace, secret.Name)
+	if secretKey != "" {
+		if err := r.List(ctx, &updatersByGitSecret, client.MatchingFields{updaterByGitSecretKey: secretKey}); err != nil {
+			log.Error(err, "failed to list ConfigMapUpdaters by git secret", "secret", secretKey)
+		} else {
+			for _, updater := range updatersByGitSecret.Items {
+				requestsByName[types.NamespacedName{Namespace: updater.Namespace, Name: updater.Name}] = struct{}{}
+			}
+		}
+	}
+
+	var destinationClusters opsv1alpha1.DestinationClusterList
+	if err := r.List(ctx, &destinationClusters, client.MatchingFields{
+		destinationClusterByKubeconfigSecretNameKey: secret.Name,
+		destinationClusterByKubeconfigSecretNSKey:   secret.Namespace,
+	}); err != nil {
+		log.Error(err, "failed to list DestinationClusters by kubeconfig secret", "secret", secretKey)
+	} else {
+		for i := range destinationClusters.Items {
+			dest := &destinationClusters.Items[i]
+			destKey := namespacedObjectKey(dest.Namespace, dest.Name)
+			if destKey == "" {
+				continue
+			}
+			var updaters opsv1alpha1.ConfigMapUpdaterList
+			if err := r.List(ctx, &updaters, client.MatchingFields{updaterByDestinationClusterKey: destKey}); err != nil {
+				log.Error(err, "failed to list ConfigMapUpdaters by destination cluster", "destinationCluster", destKey)
+				continue
+			}
+			for _, updater := range updaters.Items {
+				requestsByName[types.NamespacedName{Namespace: updater.Namespace, Name: updater.Name}] = struct{}{}
+			}
+		}
+	}
+
+	requests := make([]reconcile.Request, 0, len(requestsByName))
+	for nn := range requestsByName {
+		requests = append(requests, reconcile.Request{NamespacedName: nn})
+	}
+	return requests
+}
+
+func requestsForUpdaters(updaters []opsv1alpha1.ConfigMapUpdater) []reconcile.Request {
+	requests := make([]reconcile.Request, 0, len(updaters))
+	for i := range updaters {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: updaters[i].Namespace,
+				Name:      updaters[i].Name,
+			},
+		})
+	}
+	return requests
+}
+
+func namespacedObjectKey(namespace, name string) string {
+	if namespace == "" || name == "" {
+		return ""
+	}
+	return namespace + "/" + name
 }
 
 func (r *ConfigMapUpdaterReconciler) failStatus(
