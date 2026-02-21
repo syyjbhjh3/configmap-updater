@@ -180,24 +180,71 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.failStatus(ctx, &updater, "SourceHashError", err.Error(), interval)
 	}
 
+	targetCM, targetExists, err := r.getConfigMapWithNamespace(ctx, updater.Spec.Target.Namespace, updater.Spec.Target.Name)
+	if err != nil {
+		return r.failStatus(ctx, &updater, "TargetConfigMapReadError", err.Error(), interval)
+	}
+	if !targetExists {
+		log.Info("target ConfigMap not found in local cluster; treat as empty for comparison", "target", updater.Spec.Target)
+	}
+	targetDataForCompare, targetBinaryForCompare := filteredConfigMap(targetCM.Data, targetCM.BinaryData, ignoreKeys)
+	targetHash, err := hashConfigMap(targetDataForCompare, targetBinaryForCompare)
+	if err != nil {
+		return r.failStatus(ctx, &updater, "TargetHashError", err.Error(), interval)
+	}
+
 	if updater.Spec.Git == nil {
 		return r.failStatus(ctx, &updater, "InvalidSpec", "spec.git is required", interval)
 	}
 
 	changed := false
 	action := "noop"
-	commitHash, changedInGit, err := r.syncConfigMapToGit(ctx, &updater, sourceDataForCompare, sourceBinaryForCompare, ignoreKeys, sourceHash)
-	if err != nil {
-		return r.failStatus(ctx, &updater, "GitSyncError", err.Error(), interval)
-	}
-	changed = changedInGit
-	if changedInGit {
-		action = "updated-git"
-		if commitHash != "" {
-			action = "updated-git-" + commitHash[:7]
+	if sourceHash != targetHash {
+		log.Info("source and target configmaps differ; syncing git target file and local target", "sourceHash", sourceHash, "targetHash", targetHash)
+		commitHash, changedInGit, err := r.syncConfigMapToGit(
+			ctx,
+			&updater,
+			sourceDataForCompare,
+			sourceBinaryForCompare,
+			targetCM.Data,
+			targetCM.BinaryData,
+			ignoreKeys,
+			sourceHash,
+		)
+		if err != nil {
+			return r.failStatus(ctx, &updater, "GitSyncError", err.Error(), interval)
+		}
+		targetChanged, err := r.syncTargetConfigMapFromSource(
+			ctx,
+			&updater,
+			sourceDataForCompare,
+			sourceBinaryForCompare,
+			targetCM,
+			targetExists,
+			ignoreKeys,
+		)
+		if err != nil {
+			return r.failStatus(ctx, &updater, "TargetSyncError", err.Error(), interval)
+		}
+
+		changed = changedInGit || targetChanged
+		if changedInGit {
+			action = "updated-git"
+			if commitHash != "" {
+				action = "updated-git-" + commitHash[:7]
+			}
+		}
+		if targetChanged {
+			if action == "noop" {
+				action = "updated-target"
+			} else if !strings.HasPrefix(action, "updated-target") {
+				action = "updated-target+" + action
+			}
+		} else if !changedInGit {
+			log.Info("source-target diff exists but git target file content is already up-to-date", "filePath", updater.Spec.Git.FilePath)
 		}
 	} else {
-		log.Info("git target already up-to-date; skip update and commit")
+		log.Info("source and target configmaps are identical after ignoreKeys; skip update and commit")
 	}
 
 	if changed && updater.Spec.RestartOnChange {
@@ -245,6 +292,146 @@ func (r *ConfigMapUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
+func (r *ConfigMapUpdaterReconciler) syncTargetConfigMapFromSource(
+	ctx context.Context,
+	updater *opsv1alpha1.ConfigMapUpdater,
+	sourceData map[string]string,
+	sourceBinary map[string][]byte,
+	targetCM *corev1.ConfigMap,
+	targetExists bool,
+	ignoreKeys map[string]struct{},
+) (bool, error) {
+	if updater == nil {
+		return false, nil
+	}
+	if targetCM == nil {
+		return false, errors.New("target configmap is nil")
+	}
+
+	targetData := copyStringMap(targetCM.Data)
+	targetBinary := copyByteMap(targetCM.BinaryData)
+	nextData, nextBinary := mergeSourceAndIgnoredKeys(sourceData, sourceBinary, targetData, targetBinary, ignoreKeys)
+
+	if targetConfigMapEqual(targetCM.Data, nextData, targetCM.BinaryData, nextBinary) {
+		return false, nil
+	}
+
+	if targetExists {
+		next := targetCM.DeepCopy()
+		next.Data = nextData
+		next.BinaryData = nextBinary
+		if err := r.Update(ctx, next); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	next := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: updater.Spec.Target.Namespace,
+			Name:      updater.Spec.Target.Name,
+		},
+		Data:       nextData,
+		BinaryData: nextBinary,
+	}
+	if err := r.Create(ctx, next); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func targetConfigMapEqual(targetData, expectedData map[string]string, targetBinary, expectedBinary map[string][]byte) bool {
+	return mapsStringEqual(targetData, expectedData) && mapsByteSliceMapEqual(targetBinary, expectedBinary)
+}
+
+func mapsStringEqual(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	for key := range right {
+		if _, ok := left[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func mapsByteSliceMapEqual(left, right map[string][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		targetValue, ok := right[key]
+		if !ok {
+			return false
+		}
+		if len(targetValue) != len(value) {
+			return false
+		}
+		for idx := range value {
+			if value[idx] != targetValue[idx] {
+				return false
+			}
+		}
+	}
+	for key := range right {
+		if _, ok := left[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeSourceAndIgnoredKeys(
+	sourceData map[string]string,
+	sourceBinary map[string][]byte,
+	targetData map[string]string,
+	targetBinary map[string][]byte,
+	ignoreKeys map[string]struct{},
+) (map[string]string, map[string][]byte) {
+	nextData := copyStringMap(sourceData)
+	nextBinary := copyByteMap(sourceBinary)
+
+	for key := range ignoreKeys {
+		if value, ok := targetData[key]; ok {
+			nextData[key] = value
+		} else if value, ok := sourceData[key]; ok {
+			nextData[key] = value
+		}
+
+		if value, ok := targetBinary[key]; ok {
+			nextBinary[key] = value
+		} else if value, ok := sourceBinary[key]; ok {
+			nextBinary[key] = value
+		}
+	}
+
+	return nextData, nextBinary
+}
+
+func (r *ConfigMapUpdaterReconciler) getConfigMapWithNamespace(ctx context.Context, namespace, name string) (*corev1.ConfigMap, bool, error) {
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: namespace,
+		Name:      name,
+	}, cm)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return &corev1.ConfigMap{
+				Data:       map[string]string{},
+				BinaryData: map[string][]byte{},
+			}, false, nil
+		}
+		return nil, false, err
+	}
+	return cm, true, nil
+}
+
 func toIgnoreKeySet(ignoreKeys []string) map[string]struct{} {
 	set := make(map[string]struct{}, len(ignoreKeys))
 	for _, key := range ignoreKeys {
@@ -270,6 +457,8 @@ func (r *ConfigMapUpdaterReconciler) syncConfigMapToGit(
 	updater *opsv1alpha1.ConfigMapUpdater,
 	sourceData map[string]string,
 	sourceBinary map[string][]byte,
+	targetData map[string]string,
+	targetBinary map[string][]byte,
 	ignoreKeys map[string]struct{},
 	sourceHash string,
 ) (string, bool, error) {
@@ -328,10 +517,15 @@ func (r *ConfigMapUpdaterReconciler) syncConfigMapToGit(
 	nextBinary := copyByteMap(sourceBinary)
 	if exists {
 		for key := range ignoreKeys {
-			if value, ok := existingData[key]; ok {
+			if value, ok := targetData[key]; ok {
+				nextData[key] = value
+			} else if value, ok := existingData[key]; ok {
 				nextData[key] = value
 			}
-			if value, ok := existingBinary[key]; ok {
+
+			if value, ok := targetBinary[key]; ok {
+				nextBinary[key] = value
+			} else if value, ok := existingBinary[key]; ok {
 				nextBinary[key] = value
 			}
 		}
@@ -1021,7 +1215,12 @@ func (r *ConfigMapUpdaterReconciler) failStatus(
 		LastTransitionTime: now,
 		ObservedGeneration: updater.Generation,
 	})
-	_ = r.Status().Update(ctx, updater)
+	if err := r.Status().Update(ctx, updater); err != nil {
+		log := logf.FromContext(ctx).WithValues(
+			"configMapUpdater", fmt.Sprintf("%s/%s", updater.Namespace, updater.Name),
+		)
+		log.Error(err, "status update failed")
+	}
 	return ctrl.Result{RequeueAfter: withJitter(interval, updater.Namespace+"/"+updater.Name)}, nil
 }
 

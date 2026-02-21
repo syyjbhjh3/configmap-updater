@@ -68,7 +68,7 @@ kubectl apply -k config/samples
 2. 참조된 `DestinationCluster`를 해석합니다.
 3. Secret에서 kubeconfig를 읽어 원격 클라이언트를 구성합니다.
 4. 원격 소스 ConfigMap을 읽기 전용으로 조회합니다.
-5. 소스/이전 대상 내용을 비교합니다(hash/data/binaryData, ignoreKeys 적용).
+5. 소스(ConfigMapUpdater.spec.source, remote cluster)와 대상 타겟(ConfigMapUpdater.spec.target, 로컬 클러스터)의 내용을 비교합니다(hash/data/binaryData, ignoreKeys 적용).
 6. 변경이 있으면 git 대상 파일에서 target ConfigMap 노드를 찾아 `data`/`binaryData`를 갱신합니다.
 7. 갱신 파일을 commit/push 합니다.
 8. `restartOnChange`가 활성화되어 있으면 지정된 Deployment를 patch해 롤링 재시작을 유도합니다.
